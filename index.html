@@ -357,6 +357,19 @@
   }
   .status.warn { color: var(--warn); }
   .status.bad { color: var(--bad); }
+  .status.loading { color: var(--accent); }
+  .status.loading::before {
+    content: '';
+    display: inline-block;
+    width: 10px; height: 10px;
+    margin-right: 6px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: -1px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Profile */
   #profile {
@@ -407,6 +420,43 @@
     background: var(--accent);
     border: 2px solid #fff;
     box-shadow: 0 0 6px rgba(79,195,247,0.6);
+  }
+
+  /* Big elevation readout */
+  #big-readout {
+    position: absolute;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 600;
+    background: rgba(7, 9, 13, 0.78);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 22px;
+    text-align: center;
+    pointer-events: none;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+    min-width: 160px;
+  }
+  #big-readout .elev-num {
+    font-size: 32px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    letter-spacing: -0.5px;
+    color: #fff;
+    transition: color 80ms;
+    text-shadow: 0 0 12px currentColor;
+  }
+  #big-readout .elev-zone {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-top: 6px;
+    font-weight: 600;
   }
 
   /* Mobile */
@@ -463,7 +513,12 @@
       </div>
     </aside>
 
-    <div id="map"></div>
+    <div id="map">
+      <div id="big-readout">
+        <div class="elev-num" id="elev-num">— ft</div>
+        <div class="elev-zone" id="elev-zone">click map to begin</div>
+      </div>
+    </div>
     <button class="toggle-controls" onclick="document.getElementById('controls').classList.toggle('open')">⚙ Controls</button>
 
     <aside id="controls">
@@ -486,26 +541,17 @@
           <input type="range" id="duration" min="10" max="1800" step="5" value="180">
           <span class="slider-val" id="duration-val">3:00</span>
         </div>
-        <div class="slider-label">Notes per second</div>
-        <div class="seg" id="rate-seg">
-          <button data-rate="2">2</button>
-          <button data-rate="4" class="active">4</button>
-          <button data-rate="8">8</button>
-        </div>
         <div class="stat-row" style="margin-top:10px;">
-          <span class="k">Notes</span><span class="v" id="stat-notes">—</span>
-        </div>
-        <div class="stat-row">
-          <span class="k">Per note</span><span class="v" id="stat-pernote">—</span>
+          <span class="k">Speed</span><span class="v" id="stat-speed">—</span>
         </div>
       </div>
 
       <div class="section">
         <h3>Sound</h3>
         <div class="hint">
-          0–15,000 ft → <b>yin tone</b> (bamboo flute).<br>
+          0–15,000 ft → <b>yin tone</b> (soft flute).<br>
           Above 15,000 ft → <b>brass horn</b>.<br>
-          Three octaves, 12 semitones each (36 steps).
+          One sustained note that glides continuously across 3 octaves.
         </div>
         <div class="slider-label" style="margin-top:8px;">Volume</div>
         <div class="slider-row">
@@ -552,7 +598,6 @@
     sampledPoints: [], // [[lat,lng], ...] dense along path
     elevations: [],    // ft, parallel to sampledPoints
     distanceMi: 0,
-    notesPerSec: 4,
     durationSec: 180,
     volume: 0.65,
     playing: false,
@@ -633,9 +678,9 @@
         dur.value = suggested;
         state.durationSec = suggested;
         document.getElementById('duration-val').textContent = formatTime(suggested);
-        updateNoteCount();
       }
     }
+    updateSpeed();
     updateHeaderStatus();
   }
 
@@ -733,172 +778,195 @@
   }
 
   // -------- Synthesis --------
-  function ensureAudio() {
+  async function ensureAudio() {
     if (!state.audioCtx) {
       state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       state.masterGain = state.audioCtx.createGain();
       state.masterGain.gain.value = state.volume;
       state.masterGain.connect(state.audioCtx.destination);
     }
-    if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
+    if (state.audioCtx.state === 'suspended') {
+      await state.audioCtx.resume();
+    }
   }
 
   function freqForElevation(ft) {
-    // 36 semitones span 0..15000 ft. Above 15k extends linearly.
-    const semis = (ft / HORN_THRESHOLD_FT) * SEMITONES;
-    const clamped = Math.round(semis);
-    return BASE_FREQ * Math.pow(2, clamped / 12);
+    // Continuous mapping: 0..15000 ft spans 36 semitones (3 octaves).
+    // Above 15k continues higher; below 0 clamps to 0.
+    const semis = (Math.max(0, ft) / HORN_THRESHOLD_FT) * SEMITONES;
+    return BASE_FREQ * Math.pow(2, semis / 12);
   }
 
-  function scheduleYinNote(ctx, t0, dur, freq) {
-    const out = ctx.createGain();
-    out.gain.value = 0;
-    out.connect(state.masterGain);
+  // -------- Continuous synth (one solid sound that glides) --------
+  let synth = null;
 
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 2200;
-    lp.Q.value = 0.6;
-    lp.connect(out);
+  function startSynth(initialFreq, initialElev) {
+    const ctx = state.audioCtx;
+    const now = ctx.currentTime;
 
-    const o1 = ctx.createOscillator();
-    o1.type = 'sine';
-    o1.frequency.value = freq;
-    const o2 = ctx.createOscillator();
-    o2.type = 'triangle';
-    o2.frequency.value = freq * 2.005;
-    const o2g = ctx.createGain();
-    o2g.gain.value = 0.18;
-    o1.connect(lp);
-    o2.connect(o2g).connect(lp);
+    // Per-timbre crossfade gains (yin <-> horn)
+    const yinGain = ctx.createGain();
+    const hornGain = ctx.createGain();
+    yinGain.gain.value = 0;
+    hornGain.gain.value = 0;
+    yinGain.connect(state.masterGain);
+    hornGain.connect(state.masterGain);
 
-    // Vibrato
-    const lfo = ctx.createOscillator();
-    lfo.frequency.value = 5;
-    const lfoGain = ctx.createGain();
-    lfoGain.gain.value = freq * 0.004; // ~0.4% pitch wobble
-    lfo.connect(lfoGain);
-    lfoGain.connect(o1.frequency);
-    lfoGain.connect(o2.frequency);
+    // YIN chain: sine + triangle through soft lowpass with vibrato
+    const yinLP = ctx.createBiquadFilter();
+    yinLP.type = 'lowpass';
+    yinLP.frequency.value = 2400;
+    yinLP.Q.value = 0.5;
+    yinLP.connect(yinGain);
 
-    // Envelope (ADSR-ish)
-    const a = Math.min(0.06, dur * 0.25);
-    const r = Math.min(0.18, dur * 0.5);
-    const peak = 0.55;
-    out.gain.setValueAtTime(0, t0);
-    out.gain.linearRampToValueAtTime(peak, t0 + a);
-    out.gain.linearRampToValueAtTime(peak * 0.7, t0 + dur - r);
-    out.gain.linearRampToValueAtTime(0, t0 + dur);
+    const yinO1 = ctx.createOscillator();
+    yinO1.type = 'sine';
+    yinO1.frequency.value = initialFreq;
+    const yinO2 = ctx.createOscillator();
+    yinO2.type = 'triangle';
+    yinO2.frequency.value = initialFreq * 2.005;
+    const yinO2g = ctx.createGain();
+    yinO2g.gain.value = 0.17;
+    yinO1.connect(yinLP);
+    yinO2.connect(yinO2g).connect(yinLP);
 
-    o1.start(t0); o2.start(t0); lfo.start(t0);
-    const stopAt = t0 + dur + 0.05;
-    o1.stop(stopAt); o2.stop(stopAt); lfo.stop(stopAt);
+    // Vibrato LFO (~4.5 Hz, gentle)
+    const vibrato = ctx.createOscillator();
+    vibrato.frequency.value = 4.5;
+    const vibratoGain = ctx.createGain();
+    vibratoGain.gain.value = 1.6; // hz depth
+    vibrato.connect(vibratoGain);
+    vibratoGain.connect(yinO1.frequency);
+    vibratoGain.connect(yinO2.frequency);
+
+    // HORN chain: saw + square + sub-saw through resonant lowpass
+    const hornLP = ctx.createBiquadFilter();
+    hornLP.type = 'lowpass';
+    hornLP.frequency.value = 1600;
+    hornLP.Q.value = 1.1;
+    hornLP.connect(hornGain);
+
+    const hornO1 = ctx.createOscillator();
+    hornO1.type = 'sawtooth';
+    hornO1.frequency.value = initialFreq;
+    const hornO2 = ctx.createOscillator();
+    hornO2.type = 'square';
+    hornO2.frequency.value = initialFreq * 1.005;
+    const hornO2g = ctx.createGain();
+    hornO2g.gain.value = 0.28;
+    const hornO3 = ctx.createOscillator();
+    hornO3.type = 'sawtooth';
+    hornO3.frequency.value = initialFreq * 0.5;
+    const hornO3g = ctx.createGain();
+    hornO3g.gain.value = 0.38;
+    hornO1.connect(hornLP);
+    hornO2.connect(hornO2g).connect(hornLP);
+    hornO3.connect(hornO3g).connect(hornLP);
+
+    // Start oscillators
+    yinO1.start(now); yinO2.start(now); vibrato.start(now);
+    hornO1.start(now); hornO2.start(now); hornO3.start(now);
+
+    synth = {
+      yinGain, hornGain, yinLP, hornLP,
+      yinO1, yinO2, vibrato,
+      hornO1, hornO2, hornO3,
+    };
+
+    // Fade in to initial crossfade target over 0.15s
+    setSynthCrossfade(initialElev, now, 0.15);
   }
 
-  function scheduleHornNote(ctx, t0, dur, freq) {
-    const out = ctx.createGain();
-    out.gain.value = 0;
-    out.connect(state.masterGain);
+  function setSynthFreq(freq) {
+    if (!synth) return;
+    const ctx = state.audioCtx;
+    const t = ctx.currentTime;
+    const tau = 0.03; // smoothing time constant (sec)
+    synth.yinO1.frequency.setTargetAtTime(freq, t, tau);
+    synth.yinO2.frequency.setTargetAtTime(freq * 2.005, t, tau);
+    synth.hornO1.frequency.setTargetAtTime(freq, t, tau);
+    synth.hornO2.frequency.setTargetAtTime(freq * 1.005, t, tau);
+    synth.hornO3.frequency.setTargetAtTime(freq * 0.5, t, tau);
+    // Open horn filter as pitch rises so it stays bright up high
+    const hornCutoff = Math.min(4500, 1100 + freq * 1.6);
+    synth.hornLP.frequency.setTargetAtTime(hornCutoff, t, 0.05);
+  }
 
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 600;
-    lp.Q.value = 1.4;
-    lp.connect(out);
+  function setSynthCrossfade(elev, atTime, fadeOverride) {
+    if (!synth) return;
+    const ctx = state.audioCtx;
+    const t = atTime !== undefined ? atTime : ctx.currentTime;
+    const tau = fadeOverride !== undefined ? fadeOverride : 0.04;
+    // Crossfade window 14000–16000 ft
+    const lo = 14000, hi = 16000;
+    let mix;
+    if (elev <= lo) mix = 0;
+    else if (elev >= hi) mix = 1;
+    else mix = (elev - lo) / (hi - lo);
+    // Equal-power crossfade for smoother amplitude
+    const yinAmp = Math.cos(mix * Math.PI / 2) * 0.55;
+    const hornAmp = Math.sin(mix * Math.PI / 2) * 0.45;
+    synth.yinGain.gain.setTargetAtTime(yinAmp, t, tau);
+    synth.hornGain.gain.setTargetAtTime(hornAmp, t, tau);
+  }
 
-    const o1 = ctx.createOscillator();
-    o1.type = 'sawtooth';
-    o1.frequency.value = freq;
-    const o2 = ctx.createOscillator();
-    o2.type = 'square';
-    o2.frequency.value = freq * 1.005; // detune for thickness
-    const o2g = ctx.createGain();
-    o2g.gain.value = 0.35;
-    const o3 = ctx.createOscillator();
-    o3.type = 'sawtooth';
-    o3.frequency.value = freq * 0.5; // sub for body
-    const o3g = ctx.createGain();
-    o3g.gain.value = 0.4;
-    o1.connect(lp);
-    o2.connect(o2g).connect(lp);
-    o3.connect(o3g).connect(lp);
-
-    // Filter envelope: pop open then settle (brassy)
-    const cutoffAttack = Math.min(0.05, dur * 0.25);
-    lp.frequency.setValueAtTime(500, t0);
-    lp.frequency.linearRampToValueAtTime(2800, t0 + cutoffAttack);
-    lp.frequency.exponentialRampToValueAtTime(900, t0 + dur);
-
-    // Volume envelope
-    const a = Math.min(0.015, dur * 0.1);
-    const r = Math.min(0.08, dur * 0.3);
-    const peak = 0.42;
-    out.gain.setValueAtTime(0, t0);
-    out.gain.linearRampToValueAtTime(peak, t0 + a);
-    out.gain.linearRampToValueAtTime(peak * 0.85, t0 + dur - r);
-    out.gain.linearRampToValueAtTime(0, t0 + dur);
-
-    o1.start(t0); o2.start(t0); o3.start(t0);
-    const stopAt = t0 + dur + 0.05;
-    o1.stop(stopAt); o2.stop(stopAt); o3.stop(stopAt);
+  function stopSynth() {
+    if (!synth) return;
+    const ctx = state.audioCtx;
+    const now = ctx.currentTime;
+    const releaseSec = 0.18;
+    // Release fade
+    synth.yinGain.gain.cancelScheduledValues(now);
+    synth.hornGain.gain.cancelScheduledValues(now);
+    synth.yinGain.gain.setValueAtTime(synth.yinGain.gain.value, now);
+    synth.hornGain.gain.setValueAtTime(synth.hornGain.gain.value, now);
+    synth.yinGain.gain.linearRampToValueAtTime(0, now + releaseSec);
+    synth.hornGain.gain.linearRampToValueAtTime(0, now + releaseSec);
+    const stopAt = now + releaseSec + 0.05;
+    try { synth.yinO1.stop(stopAt); synth.yinO2.stop(stopAt); synth.vibrato.stop(stopAt); } catch(e){}
+    try { synth.hornO1.stop(stopAt); synth.hornO2.stop(stopAt); synth.hornO3.stop(stopAt); } catch(e){}
+    synth = null;
   }
 
   // -------- Playback --------
-  function play() {
+  async function play() {
     if (state.playing) return;
     if (!state.elevations.length) return;
-    ensureAudio();
+
+    const myToken = (state.playToken = Symbol('play'));
+    document.getElementById('btn-play').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    setStatus('Compiling song…', 'loading');
+
+    await ensureAudio();
+    if (state.playToken !== myToken) return;
     state.masterGain.gain.value = state.volume;
 
     const ctx = state.audioCtx;
-    const noteCount = Math.max(2, Math.round(state.durationSec * state.notesPerSec));
-    const noteDur = 1 / state.notesPerSec;
+    const startElev = state.elevations[0];
+    const startFreq = freqForElevation(startElev);
 
-    // Resample elevations to noteCount via linear interp
-    const playElevs = resample(state.elevations, noteCount);
-    const playPoints = resample2D(state.sampledPoints, noteCount);
+    // Pre-warm synth: starts oscillators silently and fades in to target gain
+    startSynth(startFreq, startElev);
 
-    const t0 = ctx.currentTime + 0.15;
-    for (let i = 0; i < noteCount; i++) {
-      const t = t0 + i * noteDur;
-      const ft = playElevs[i];
-      const f = freqForElevation(ft);
-      if (ft > HORN_THRESHOLD_FT) scheduleHornNote(ctx, t, noteDur * 1.05, f);
-      else scheduleYinNote(ctx, t, noteDur * 1.05, f);
-    }
+    // Wait for warm-up: oscillators stabilize + crossfade fades in
+    await new Promise(r => setTimeout(r, 280));
+    if (state.playToken !== myToken) { stopSynth(); return; }
+
     state.playing = true;
-    state.playStart = t0;
-    state.playElevs = playElevs;
-    state.playPoints = playPoints;
-    state.playNoteCount = noteCount;
-    state.playNoteDur = noteDur;
+    state.playStart = ctx.currentTime;
+    state.playDuration = state.durationSec;
 
-    document.getElementById('btn-play').disabled = true;
-    document.getElementById('btn-stop').disabled = false;
     setStatus('Playing…');
     ensureMovingDot();
+    updateBigReadout(startElev);
     animate();
   }
 
   function stop() {
-    if (!state.playing && !state.audioCtx) return;
-    if (state.audioCtx) {
-      // Fade master to zero quickly to kill scheduled notes
-      const g = state.masterGain.gain;
-      const now = state.audioCtx.currentTime;
-      g.cancelScheduledValues(now);
-      g.setValueAtTime(g.value, now);
-      g.linearRampToValueAtTime(0, now + 0.05);
-      // Recreate masterGain so future plays don't have lingering envelope
-      setTimeout(() => {
-        try {
-          state.masterGain.disconnect();
-        } catch (e) {}
-        state.masterGain = state.audioCtx.createGain();
-        state.masterGain.gain.value = state.volume;
-        state.masterGain.connect(state.audioCtx.destination);
-      }, 80);
-    }
+    state.playToken = null;
+    if (!state.playing && !synth) return;
+    stopSynth();
     state.playing = false;
     if (state.rafId) cancelAnimationFrame(state.rafId);
     state.rafId = null;
@@ -907,6 +975,7 @@
     setStatus('Stopped.');
     if (movingDot) { movingDot.remove(); movingDot = null; }
     drawProfile();
+    updateHeaderStatus();
   }
 
   function ensureMovingDot() {
@@ -924,16 +993,22 @@
     if (!state.playing) return;
     const ctx = state.audioCtx;
     const elapsed = ctx.currentTime - state.playStart;
-    const totalDur = state.playNoteCount * state.playNoteDur;
-    if (elapsed >= totalDur) { stop(); return; }
-    const fIdx = Math.max(0, elapsed * state.notesPerSec); // fractional index
-    const i0 = Math.min(Math.floor(fIdx), state.playNoteCount - 1);
-    const i1 = Math.min(i0 + 1, state.playNoteCount - 1);
-    const frac = fIdx - i0;
-    const lat = state.playPoints[i0][0]*(1-frac) + state.playPoints[i1][0]*frac;
-    const lng = state.playPoints[i0][1]*(1-frac) + state.playPoints[i1][1]*frac;
-    const elev = state.playElevs[i0]*(1-frac) + state.playElevs[i1]*frac;
+    if (elapsed >= state.playDuration) { stop(); return; }
+    const frac = Math.max(0, Math.min(1, elapsed / state.playDuration));
+    const N = state.elevations.length;
+    const fI = frac * (N - 1);
+    const i0 = Math.floor(fI);
+    const i1 = Math.min(i0 + 1, N - 1);
+    const f = fI - i0;
+    const lat = state.sampledPoints[i0][0]*(1-f) + state.sampledPoints[i1][0]*f;
+    const lng = state.sampledPoints[i0][1]*(1-f) + state.sampledPoints[i1][1]*f;
+    const elev = state.elevations[i0]*(1-f) + state.elevations[i1]*f;
 
+    // Drive the continuous synth
+    setSynthFreq(freqForElevation(elev));
+    setSynthCrossfade(elev);
+
+    // Visuals
     if (movingDot) {
       movingDot.setLatLng([lat, lng]);
       const color = colorForElevation(elev);
@@ -944,7 +1019,8 @@
       }
     }
     updateRainbowIndicator(elev);
-    drawProfile(fIdx / state.playNoteCount);
+    updateBigReadout(elev);
+    drawProfile(frac);
 
     state.rafId = requestAnimationFrame(animate);
   }
@@ -1128,11 +1204,30 @@
     const m = Math.floor(sec / 60), s = Math.round(sec % 60);
     return m + ':' + String(s).padStart(2, '0');
   }
-  function updateNoteCount() {
-    const n = Math.max(2, Math.round(state.durationSec * state.notesPerSec));
-    document.getElementById('stat-notes').textContent = n.toLocaleString();
-    document.getElementById('stat-pernote').textContent =
-      state.distanceMi ? (state.distanceMi / n).toFixed(2) + ' mi' : '—';
+  function updateSpeed() {
+    const speedEl = document.getElementById('stat-speed');
+    if (!state.distanceMi || !state.durationSec) {
+      speedEl.textContent = '—';
+      return;
+    }
+    const mph = (state.distanceMi / state.durationSec) * 3600;
+    if (mph >= 100) speedEl.textContent = Math.round(mph).toLocaleString() + ' mph';
+    else speedEl.textContent = mph.toFixed(1) + ' mph';
+  }
+  function updateBigReadout(ft) {
+    const num = document.getElementById('elev-num');
+    const zone = document.getElementById('elev-zone');
+    if (ft === null || ft === undefined || isNaN(ft)) {
+      num.textContent = '— ft';
+      num.style.color = '#fff';
+      zone.textContent = state.waypoints.length < 2
+        ? 'click map to begin'
+        : (state.elevations.length ? 'ready to play' : 'sample to begin');
+      return;
+    }
+    num.textContent = Math.round(ft).toLocaleString() + ' ft';
+    num.style.color = colorForElevation(ft);
+    zone.textContent = ft >= HORN_THRESHOLD_FT ? '🎺 horn' : '🎐 yin';
   }
 
   // -------- Wire up controls --------
@@ -1165,6 +1260,7 @@
       document.getElementById('stat-max').textContent = Math.round(mx).toLocaleString() + ' ft';
       document.getElementById('btn-play').disabled = false;
       drawProfile();
+      updateBigReadout(elevs[0]);
       // Fit map to path
       if (state.polyline) {
         try { map.fitBounds(state.polyline.getBounds(), { padding: [40, 40] }); } catch(e) {}
@@ -1186,26 +1282,19 @@
     e.target.dataset.userTouched = '1';
     state.durationSec = parseInt(e.target.value, 10);
     document.getElementById('duration-val').textContent = formatTime(state.durationSec);
-    updateNoteCount();
+    updateSpeed();
   });
   document.getElementById('volume').addEventListener('input', (e) => {
     state.volume = parseInt(e.target.value, 10) / 100;
     document.getElementById('volume-val').textContent = e.target.value + '%';
     if (state.masterGain) state.masterGain.gain.value = state.volume;
   });
-  document.querySelectorAll('#rate-seg button').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('#rate-seg button').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.notesPerSec = parseInt(btn.dataset.rate, 10);
-      updateNoteCount();
-    });
-  });
 
   // -------- Init --------
   buildRainbowTicks();
   updateRainbowIndicator(0);
-  updateNoteCount();
+  updateBigReadout(null);
+  updateSpeed();
   setTimeout(resizeCanvas, 50);
   // Resize observer for the profile canvas
   if (window.ResizeObserver) {
